@@ -35,8 +35,6 @@ jobs:
         $zip = "$env:RUNNER_TEMP\boost_1_84_0.zip"
         $dest = "$env:GITHUB_WORKSPACE\boost-local"
 
-        Write-Host "Downloading Boost 1.84.0..."
-
         Invoke-WebRequest `
           "https://archives.boost.io/release/1.84.0/source/boost_1_84_0.zip" `
           -OutFile $zip
@@ -50,8 +48,6 @@ jobs:
         if (!(Test-Path "$root\boost\version.hpp")) {
             throw "Boost extraction failed"
         }
-
-        Write-Host "Boost headers installed at $root"
 
     - uses: ilammy/msvc-dev-cmd@v1
       with:
@@ -85,8 +81,6 @@ jobs:
 
         [IO.File]::WriteAllText($path, $text)
 
-        Write-Host "Meson now uses local Boost headers."
-
     - name: Patch display for E-flat baritone sax
       shell: pwsh
       run: |
@@ -94,7 +88,6 @@ jobs:
         function Replace-One($path, $pattern, $replacement, $label) {
 
             $text = [IO.File]::ReadAllText($path)
-
             $rx = [regex]::new($pattern)
 
             $count = $rx.Matches($text).Count
@@ -119,24 +112,20 @@ jobs:
 
 
         # ============================================================
-        # E-flat baritone sax
+        # BARITONE SAX DISPLAY
         #
-        # Concert/sounding -> written bari = +21 semitones
+        # Concert/sounding -> written Eb bari = +21 semitones.
         #
-        # Frequency multiplier:
-        # 2^(21/12) = 3.363585661014858
-        #
-        # The underlying pYIN/Tony pitch data are NOT changed.
-        # Only the visual display is changed.
-        #
-        # Preferred written-note spelling:
+        # Preferred spelling:
         #
         # C C# D D# E F F# G G# A Bb B
+        #
+        # The underlying pYIN pitch values are NOT changed.
         # ============================================================
 
 
         # ------------------------------------------------------------
-        # 1. Continuous pitch-track hover readout
+        # 1. Pitch-track hover
         # ------------------------------------------------------------
 
         $timePattern = 'valueText = tr\("%1 Hz \(%2, %3\)"\)\s*\.arg\(value\)\s*\.arg\(Pitch::getPitchLabelForFrequency\(value\)\)\s*\.arg\(Pitch::getPitchForFrequency\(value\)\);'
@@ -157,11 +146,11 @@ jobs:
             "svgui/layer/TimeValueLayer.cpp" `
             $timePattern `
             $timeReplacement `
-            "Pitch-track hover patch"
+            "Pitch-track hover"
 
 
         # ------------------------------------------------------------
-        # 2. Detected-note hover readout
+        # 2. Note hover
         # ------------------------------------------------------------
 
         $notePattern = 'pitchText = tr\("%1 Hz \(%2, %3\)"\)\s*\.arg\(note\.getValue\(\)\)\s*\.arg\(Pitch::getPitchLabelForFrequency\(note\.getValue\(\)\)\)\s*\.arg\(Pitch::getPitchForFrequency\(note\.getValue\(\)\)\);'
@@ -182,17 +171,12 @@ jobs:
             "svgui/layer/FlexiNoteLayer.cpp" `
             $notePattern `
             $noteReplacement `
-            "Note hover patch"
+            "Note hover"
 
 
         # ------------------------------------------------------------
-        # 3. Give FlexiNote its own pitch scale
-        #
-        # Tony normally starts FlexiNoteLayer in AutoAlignScale.
-        # We want it to have its own logarithmic Hz coordinate scale.
-        #
-        # m_scaleMinimum == m_scaleMaximum means:
-        # use the actual detected-note range.
+        # 3. Constructor:
+        #    FlexiNote MUST start with its own logarithmic scale.
         # ------------------------------------------------------------
 
         $defaultsPattern = 'm_verticalScale\(AutoAlignScale\),\s*m_editMode\(DragNote\),\s*m_scaleMinimum\(34\),\s*m_scaleMaximum\(77\)'
@@ -208,19 +192,71 @@ jobs:
             "svgui/layer/FlexiNoteLayer.cpp" `
             $defaultsPattern `
             $defaultsReplacement `
-            "Independent pitch-scale patch"
+            "FlexiNote LogScale constructor"
 
 
         # ------------------------------------------------------------
-        # 4. Selected-note text
+        # 4. IMPORTANT:
         #
-        # Replace:
+        # Tony can restore verticalScale=0 (Auto-Align) from saved
+        # layer/session properties AFTER construction.
+        #
+        # For this custom bari build we never allow FlexiNote to
+        # return to AutoAlignScale. AutoAlign requests become LogScale.
+        # ------------------------------------------------------------
+
+        $setScalePattern = '(?s)void\s+FlexiNoteLayer::setVerticalScale\(VerticalScale scale\)\s*\{\s*if \(m_verticalScale == scale\) return;\s*m_verticalScale = scale;\s*emit layerParametersChanged\(\);\s*\}'
+
+        $setScaleReplacement = @"
+        void
+        FlexiNoteLayer::setVerticalScale(VerticalScale scale)
+        {
+            // Tony normally permits AutoAlignScale.
+            // In the bari build the note layer must always own
+            // a real pitch coordinate scale.
+
+            if (scale == AutoAlignScale) {
+                scale = LogScale;
+            }
+
+            if (m_verticalScale == scale) return;
+
+            m_verticalScale = scale;
+            emit layerParametersChanged();
+        }
+        "@
+
+        Replace-One `
+            "svgui/layer/FlexiNoteLayer.cpp" `
+            $setScalePattern `
+            $setScaleReplacement `
+            "Prevent FlexiNote Auto-Align"
+
+
+        # ------------------------------------------------------------
+        # 5. Also change the declared default property from
+        #    Auto-Align to Log.
+        # ------------------------------------------------------------
+
+        $propertyDefaultPattern = 'if \(deflt\) \*deflt = int\(AutoAlignScale\);'
+
+        $propertyDefaultReplacement = @"
+        if (deflt) *deflt = int(LogScale);
+        "@
+
+        Replace-One `
+            "svgui/layer/FlexiNoteLayer.cpp" `
+            $propertyDefaultPattern `
+            $propertyDefaultReplacement `
+            "LogScale property default"
+
+
+        # ------------------------------------------------------------
+        # 6. Selected-note text:
         #
         # freq: 69.3Hz
         #
-        # with for example:
-        #
-        # note: Bb3 (Bari)
+        # -> note: Bb3 (Bari)
         # ------------------------------------------------------------
 
         $selectedPattern = 'QString vlabel = tr\("freq: %1%2"\)\s*\.arg\(p\.getValue\(\)\)\.arg\(model->getScaleUnits\(\)\);'
@@ -271,12 +307,8 @@ jobs:
 
                         vlabel =
                             tr("freq: %1%2")
-                            .arg(
-                                p.getValue()
-                            )
-                            .arg(
-                                model->getScaleUnits()
-                            );
+                            .arg(p.getValue())
+                            .arg(model->getScaleUnits());
                     }
         "@
 
@@ -284,19 +316,24 @@ jobs:
             "svgui/layer/FlexiNoteLayer.cpp" `
             $selectedPattern `
             $selectedReplacement `
-            "Selected-note label patch"
+            "Selected-note label"
 
 
         # ------------------------------------------------------------
-        # 5. Replace numerical Hz Y-axis with written bari notes
+        # 7. BARI Y AXIS
         #
-        # The actual coordinate remains the original sounding Hz.
+        # Coordinates remain sounding Hz.
         #
-        # Labels are:
+        # Labels become:
         #
-        # C C# D D# E F F# G G# A Bb B
-        #
-        # transposed +21 semitones for written Eb baritone.
+        # Bb3
+        # B3
+        # C4
+        # C#4
+        # D4
+        # D#4
+        # E4
+        # ...
         # ------------------------------------------------------------
 
         $axisPattern = '(?s)void\s+FlexiNoteLayer::paintVerticalScale\(LayerGeometryProvider \*v, bool, QPainter &paint, QRect\) const\s*\{.*?\}\s*void\s+FlexiNoteLayer::drawStart'
@@ -311,9 +348,7 @@ jobs:
         ) const
         {
             auto model =
-                ModelById::getAs<NoteModel>(
-                    m_model
-                );
+                ModelById::getAs<NoteModel>(m_model);
 
             if (!model || model->isEmpty()) {
                 return;
@@ -333,34 +368,35 @@ jobs:
                 v->getPaintHeight();
 
 
-            if (scale.getUnit() == "Hz") {
+            static const char *noteNames[12] = {
+                "C",
+                "C#",
+                "D",
+                "D#",
+                "E",
+                "F",
+                "F#",
+                "G",
+                "G#",
+                "A",
+                "Bb",
+                "B"
+            };
 
-                static const char *noteNames[12] = {
-                    "C",
-                    "C#",
-                    "D",
-                    "D#",
-                    "E",
-                    "F",
-                    "F#",
-                    "G",
-                    "G#",
-                    "A",
-                    "Bb",
-                    "B"
-                };
+
+            if (scale.getUnit() == "Hz") {
 
                 int lastLabelY = -10000;
 
-
-                // Sounding MIDI 0..106 becomes
-                // written bari MIDI 21..127.
 
                 for (
                     int soundingMidi = 0;
                     soundingMidi <= 106;
                     ++soundingMidi
                 ) {
+
+                    // Eb baritone written pitch
+                    // is 21 semitones above sounding pitch.
 
                     const int writtenMidi =
                         soundingMidi + 21;
@@ -376,6 +412,7 @@ jobs:
                             frequency
                         );
 
+
                     if (
                         y < 0 ||
                         y > h
@@ -384,8 +421,7 @@ jobs:
                     }
 
 
-                    // Avoid text physically overlapping if the
-                    // displayed range becomes very large.
+                    // Prevent labels overlapping visually.
 
                     if (
                         lastLabelY != -10000 &&
@@ -440,14 +476,6 @@ jobs:
                 );
 
 
-                paint.drawText(
-                    2,
-                    5 +
-                    paint.fontMetrics().ascent(),
-                    tr("Bari")
-                );
-
-
             } else {
 
                 if (scale.isLogarithmic()) {
@@ -470,24 +498,6 @@ jobs:
                             0
                         );
                 }
-
-
-                if (getScaleUnits() != "") {
-
-                    int mw =
-                        w - 5;
-
-                    paint.drawText(
-                        5,
-                        5 +
-                        paint.fontMetrics().ascent(),
-                        TextAbbrev::abbreviate(
-                            getScaleUnits(),
-                            paint.fontMetrics(),
-                            mw
-                        )
-                    );
-                }
             }
         }
 
@@ -500,27 +510,47 @@ jobs:
             "svgui/layer/FlexiNoteLayer.cpp" `
             $axisPattern `
             $axisReplacement `
-            "Bari Y-axis drawing patch"
+            "Bari note Y-axis"
 
 
         # ------------------------------------------------------------
-        # 6. IMPORTANT:
+        # 8. Give enough width for labels such as "Bb3" / "C#4".
         #
-        # Force Tony's Pane to use the FlexiNote layer for the
-        # visible left-hand vertical scale whenever that layer is
-        # present and visible.
-        #
-        # Previously Pane.cpp could choose WaveformLayer instead,
-        # resulting in:
-        #
-        #  1
-        #  0
-        # -1
-        #
-        # even though our FlexiNote bari scale existed.
+        # Also guarantees FlexiNote advertises a non-zero scale width.
         # ------------------------------------------------------------
 
-        $panePattern = 'm_scaleWidth = 0;\s*if \(m_manager &&\s*m_manager->shouldShowVerticalScale\(\) && topLayer\) \{\s*drawVerticalScale\(r, topLayer, paint\);\s*\}'
+        $widthPattern = '(?s)int\s+FlexiNoteLayer::getVerticalScaleWidth\(LayerGeometryProvider \*v, bool, QPainter &paint\) const\s*\{.*?\}\s*void\s+FlexiNoteLayer::paintVerticalScale'
+
+        $widthReplacement = @"
+        int
+        FlexiNoteLayer::getVerticalScaleWidth(
+            LayerGeometryProvider *,
+            bool,
+            QPainter &paint
+        ) const
+        {
+            return paint.fontMetrics().horizontalAdvance("Bb10") + 12;
+        }
+
+        void
+        FlexiNoteLayer::paintVerticalScale
+        "@
+
+        Replace-One `
+            "svgui/layer/FlexiNoteLayer.cpp" `
+            $widthPattern `
+            $widthReplacement `
+            "Bari Y-axis width"
+
+
+        # ------------------------------------------------------------
+        # 9. PANE:
+        #
+        # Explicitly prefer a visible FlexiNoteLayer for the pane's
+        # left-hand scale instead of WaveformLayer.
+        # ------------------------------------------------------------
+
+        $panePattern = 'm_scaleWidth = 0;\s*if \(m_manager && m_manager->shouldShowVerticalScale\(\) && topLayer\) \{\s*drawVerticalScale\(r, topLayer, paint\);\s*\}'
 
         $paneReplacement = @"
         m_scaleWidth = 0;
@@ -531,14 +561,8 @@ jobs:
                 topLayer
             ) {
 
-                Layer *verticalScaleLayer = topLayer;
-
-                // Prefer a visible FlexiNote layer as the
-                // reference scale for Tony.
-                //
-                // This makes the left-hand scale correspond
-                // to the pitch/note display rather than the
-                // waveform amplitude.
+                Layer *verticalScaleLayer =
+                    topLayer;
 
                 for (
                     auto i = m_layerStack.rbegin();
@@ -546,7 +570,8 @@ jobs:
                     ++i
                 ) {
 
-                    Layer *candidate = *i;
+                    Layer *candidate =
+                        *i;
 
                     if (
                         candidate->isLayerDormant(this)
@@ -557,8 +582,9 @@ jobs:
                     if (
                         dynamic_cast<FlexiNoteLayer *>(
                             candidate
-                        )
+                        ) != nullptr
                     ) {
+
                         verticalScaleLayer =
                             candidate;
 
@@ -578,11 +604,15 @@ jobs:
             "svgui/view/Pane.cpp" `
             $panePattern `
             $paneReplacement `
-            "Prefer FlexiNote Y-axis patch"
+            "Prefer FlexiNote pane Y-axis"
 
 
         Write-Host ""
-        Write-Host "All baritone display patches applied successfully."
+        Write-Host "======================================"
+        Write-Host "All bari display patches applied."
+        Write-Host "FlexiNote Auto-Align is disabled."
+        Write-Host "Pane prefers FlexiNote pitch scale."
+        Write-Host "======================================"
 
 
     - name: configure
@@ -613,8 +643,6 @@ jobs:
             throw "Tony executable not found"
         }
 
-        Write-Host "Running windeployqt..."
-
         & $windeployqt `
           --release `
           --compiler-runtime `
@@ -628,10 +656,6 @@ jobs:
         if (!(Test-Path "build\platforms\qwindows.dll")) {
             throw "qwindows.dll was not deployed"
         }
-
-        Write-Host "Qt runtime deployed successfully."
-
-        Get-Item "build\platforms\qwindows.dll"
 
     - name: Upload Tony Bari
       uses: actions/upload-artifact@v4
