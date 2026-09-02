@@ -11,6 +11,7 @@ jobs:
     runs-on: windows-2022
 
     steps:
+
     - uses: actions/checkout@v4
 
     - uses: ProjectSavanna/setup-sml@v1.2.0
@@ -28,41 +29,29 @@ jobs:
         target: 'desktop'
         arch: 'win64_msvc2019_64'
 
-    - name: Find or install Boost
+    - name: Install Boost headers
       shell: pwsh
       run: |
-        $boost = Get-ChildItem C:\local -Directory -Filter "boost_*" -ErrorAction SilentlyContinue |
-          Sort-Object Name -Descending |
-          Select-Object -First 1
+        $zip = "$env:RUNNER_TEMP\boost_1_84_0.zip"
+        $dest = "$env:GITHUB_WORKSPACE\boost-local"
 
-        if ($boost) {
-            Write-Host "Using preinstalled Boost: $($boost.FullName)"
-            "BOOST_ROOT=$($boost.FullName)" >> $env:GITHUB_ENV
+        Write-Host "Downloading Boost 1.84.0..."
+
+        Invoke-WebRequest `
+          "https://archives.boost.io/release/1.84.0/source/boost_1_84_0.zip" `
+          -OutFile $zip
+
+        Expand-Archive `
+          -Path $zip `
+          -DestinationPath $dest
+
+        $root = "$dest\boost_1_84_0"
+
+        if (!(Test-Path "$root\boost\version.hpp")) {
+            throw "Boost extraction failed"
         }
-        else {
-            Write-Host "No preinstalled Boost found."
-            Write-Host "Downloading official Boost 1.84.0 source ZIP..."
 
-            $zip = "$env:RUNNER_TEMP\boost_1_84_0.zip"
-            $dest = "$env:RUNNER_TEMP\boost"
-
-            Invoke-WebRequest `
-              "https://archives.boost.io/release/1.84.0/source/boost_1_84_0.zip" `
-              -OutFile $zip
-
-            Expand-Archive `
-              -Path $zip `
-              -DestinationPath $dest
-
-            $root = "$dest\boost_1_84_0"
-
-            if (!(Test-Path "$root\boost\version.hpp")) {
-                throw "Boost extraction failed: boost\version.hpp not found"
-            }
-
-            Write-Host "Boost installed at: $root"
-            "BOOST_ROOT=$root" >> $env:GITHUB_ENV
-        }
+        Write-Host "Boost headers installed at $root"
 
     - uses: ilammy/msvc-dev-cmd@v1
       with:
@@ -74,61 +63,575 @@ jobs:
     - name: repoint
       run: ./repoint install
 
+    - name: Patch Meson Boost dependency
+      shell: pwsh
+      run: |
+        $path = "meson.build"
+        $text = [IO.File]::ReadAllText($path)
+
+        $old = "boost_dep = dependency('boost')"
+        $new = "boost_dep = declare_dependency(include_directories: include_directories('boost-local/boost_1_84_0'))"
+
+        $count = ([regex]::Matches(
+            $text,
+            [regex]::Escape($old)
+        )).Count
+
+        if ($count -ne 1) {
+            throw "Expected exactly one Boost dependency line, found $count"
+        }
+
+        $text = $text.Replace($old, $new)
+
+        [IO.File]::WriteAllText($path, $text)
+
+        Write-Host "Meson now uses local Boost headers."
+
     - name: Patch display for E-flat baritone sax
       shell: pwsh
       run: |
-        function Replace-One($path, $pattern, $replacement) {
+
+        function Replace-One($path, $pattern, $replacement, $label) {
+
             $text = [IO.File]::ReadAllText($path)
+
             $rx = [regex]::new($pattern)
 
             $count = $rx.Matches($text).Count
+
             if ($count -ne 1) {
-                throw "Expected exactly one match in $path, found $count"
+                throw "$label : expected exactly one match in $path, found $count"
             }
 
-            $text = $rx.Replace($text, $replacement, 1)
-            [IO.File]::WriteAllText($path, $text)
+            $text = $rx.Replace(
+                $text,
+                $replacement,
+                1
+            )
+
+            [IO.File]::WriteAllText(
+                $path,
+                $text
+            )
+
+            Write-Host "$label applied successfully."
         }
 
-        # +21 semitones = written pitch for E-flat baritone sax
-        # Frequency multiplier = 2^(21/12) = 3.363585661014858
+
+        # ============================================================
+        # E-flat baritone sax
+        #
+        # Concert/sounding -> written bari = +21 semitones
+        #
+        # Frequency multiplier:
+        # 2^(21/12) = 3.363585661014858
+        #
+        # The underlying pYIN/Tony pitch data are NOT changed.
+        # Only the visual display is changed.
+        #
+        # Preferred written-note spelling:
+        #
+        # C C# D D# E F F# G G# A Bb B
+        # ============================================================
+
+
+        # ------------------------------------------------------------
+        # 1. Continuous pitch-track hover readout
+        # ------------------------------------------------------------
 
         $timePattern = 'valueText = tr\("%1 Hz \(%2, %3\)"\)\s*\.arg\(value\)\s*\.arg\(Pitch::getPitchLabelForFrequency\(value\)\)\s*\.arg\(Pitch::getPitchForFrequency\(value\)\);'
 
         $timeReplacement = @"
-        const double bariValue = value * 3.363585661014858;
+        const double bariValue =
+                    value * 3.363585661014858;
+
                 valueText = tr("%1 (Bari)")
-                    .arg(Pitch::getPitchLabelForFrequency(bariValue));
+                    .arg(
+                        Pitch::getPitchLabelForFrequency(
+                            bariValue
+                        )
+                    );
         "@
 
         Replace-One `
             "svgui/layer/TimeValueLayer.cpp" `
             $timePattern `
-            $timeReplacement
+            $timeReplacement `
+            "Pitch-track hover patch"
+
+
+        # ------------------------------------------------------------
+        # 2. Detected-note hover readout
+        # ------------------------------------------------------------
 
         $notePattern = 'pitchText = tr\("%1 Hz \(%2, %3\)"\)\s*\.arg\(note\.getValue\(\)\)\s*\.arg\(Pitch::getPitchLabelForFrequency\(note\.getValue\(\)\)\)\s*\.arg\(Pitch::getPitchForFrequency\(note\.getValue\(\)\)\);'
 
         $noteReplacement = @"
-        const double bariValue = note.getValue() * 3.363585661014858;
+        const double bariValue =
+                    note.getValue() * 3.363585661014858;
+
                 pitchText = tr("%1 (Bari)")
-                    .arg(Pitch::getPitchLabelForFrequency(bariValue));
+                    .arg(
+                        Pitch::getPitchLabelForFrequency(
+                            bariValue
+                        )
+                    );
         "@
 
         Replace-One `
             "svgui/layer/FlexiNoteLayer.cpp" `
             $notePattern `
-            $noteReplacement
+            $noteReplacement `
+            "Note hover patch"
+
+
+        # ------------------------------------------------------------
+        # 3. Give FlexiNote its own pitch scale
+        #
+        # Tony normally starts FlexiNoteLayer in AutoAlignScale.
+        # We want it to have its own logarithmic Hz coordinate scale.
+        #
+        # m_scaleMinimum == m_scaleMaximum means:
+        # use the actual detected-note range.
+        # ------------------------------------------------------------
+
+        $defaultsPattern = 'm_verticalScale\(AutoAlignScale\),\s*m_editMode\(DragNote\),\s*m_scaleMinimum\(34\),\s*m_scaleMaximum\(77\)'
+
+        $defaultsReplacement = @"
+        m_verticalScale(LogScale),
+            m_editMode(DragNote),
+            m_scaleMinimum(0),
+            m_scaleMaximum(0)
+        "@
+
+        Replace-One `
+            "svgui/layer/FlexiNoteLayer.cpp" `
+            $defaultsPattern `
+            $defaultsReplacement `
+            "Independent pitch-scale patch"
+
+
+        # ------------------------------------------------------------
+        # 4. Selected-note text
+        #
+        # Replace:
+        #
+        # freq: 69.3Hz
+        #
+        # with for example:
+        #
+        # note: Bb3 (Bari)
+        # ------------------------------------------------------------
+
+        $selectedPattern = 'QString vlabel = tr\("freq: %1%2"\)\s*\.arg\(p\.getValue\(\)\)\.arg\(model->getScaleUnits\(\)\);'
+
+        $selectedReplacement = @"
+        QString vlabel;
+
+                    if (model->getScaleUnits() == "Hz") {
+
+                        const double bariValue =
+                            p.getValue() *
+                            3.363585661014858;
+
+                        const int bariMidi =
+                            Pitch::getPitchForFrequency(
+                                bariValue
+                            );
+
+                        static const char *bariNames[12] = {
+                            "C",
+                            "C#",
+                            "D",
+                            "D#",
+                            "E",
+                            "F",
+                            "F#",
+                            "G",
+                            "G#",
+                            "A",
+                            "Bb",
+                            "B"
+                        };
+
+                        vlabel =
+                            tr("note: %1%2 (Bari)")
+                            .arg(
+                                QString::fromLatin1(
+                                    bariNames[
+                                        bariMidi % 12
+                                    ]
+                                )
+                            )
+                            .arg(
+                                bariMidi / 12 - 1
+                            );
+
+                    } else {
+
+                        vlabel =
+                            tr("freq: %1%2")
+                            .arg(
+                                p.getValue()
+                            )
+                            .arg(
+                                model->getScaleUnits()
+                            );
+                    }
+        "@
+
+        Replace-One `
+            "svgui/layer/FlexiNoteLayer.cpp" `
+            $selectedPattern `
+            $selectedReplacement `
+            "Selected-note label patch"
+
+
+        # ------------------------------------------------------------
+        # 5. Replace numerical Hz Y-axis with written bari notes
+        #
+        # The actual coordinate remains the original sounding Hz.
+        #
+        # Labels are:
+        #
+        # C C# D D# E F F# G G# A Bb B
+        #
+        # transposed +21 semitones for written Eb baritone.
+        # ------------------------------------------------------------
+
+        $axisPattern = '(?s)void\s+FlexiNoteLayer::paintVerticalScale\(LayerGeometryProvider \*v, bool, QPainter &paint, QRect\) const\s*\{.*?\}\s*void\s+FlexiNoteLayer::drawStart'
+
+        $axisReplacement = @"
+        void
+        FlexiNoteLayer::paintVerticalScale(
+            LayerGeometryProvider *v,
+            bool,
+            QPainter &paint,
+            QRect
+        ) const
+        {
+            auto model =
+                ModelById::getAs<NoteModel>(
+                    m_model
+                );
+
+            if (!model || model->isEmpty()) {
+                return;
+            }
+
+            CoordinateScale scale =
+                getVerticalExtents().second;
+
+            int w =
+                getVerticalScaleWidth(
+                    v,
+                    false,
+                    paint
+                );
+
+            int h =
+                v->getPaintHeight();
+
+
+            if (scale.getUnit() == "Hz") {
+
+                static const char *noteNames[12] = {
+                    "C",
+                    "C#",
+                    "D",
+                    "D#",
+                    "E",
+                    "F",
+                    "F#",
+                    "G",
+                    "G#",
+                    "A",
+                    "Bb",
+                    "B"
+                };
+
+                int lastLabelY = -10000;
+
+
+                // Sounding MIDI 0..106 becomes
+                // written bari MIDI 21..127.
+
+                for (
+                    int soundingMidi = 0;
+                    soundingMidi <= 106;
+                    ++soundingMidi
+                ) {
+
+                    const int writtenMidi =
+                        soundingMidi + 21;
+
+                    const double frequency =
+                        Pitch::getFrequencyForPitch(
+                            soundingMidi
+                        );
+
+                    const int y =
+                        scale.getCoordForValueRounded(
+                            v,
+                            frequency
+                        );
+
+                    if (
+                        y < 0 ||
+                        y > h
+                    ) {
+                        continue;
+                    }
+
+
+                    // Avoid text physically overlapping if the
+                    // displayed range becomes very large.
+
+                    if (
+                        lastLabelY != -10000 &&
+                        std::abs(
+                            y - lastLabelY
+                        ) <
+                        paint.fontMetrics().height()
+                    ) {
+                        continue;
+                    }
+
+
+                    QString label =
+                        QString("%1%2")
+                        .arg(
+                            QString::fromLatin1(
+                                noteNames[
+                                    writtenMidi % 12
+                                ]
+                            )
+                        )
+                        .arg(
+                            writtenMidi / 12 - 1
+                        );
+
+
+                    paint.drawText(
+                        2,
+                        y +
+                        paint.fontMetrics().ascent() / 2,
+                        label
+                    );
+
+
+                    paint.drawLine(
+                        w - 5,
+                        y,
+                        w,
+                        y
+                    );
+
+
+                    lastLabelY = y;
+                }
+
+
+                paint.drawLine(
+                    w,
+                    0,
+                    w,
+                    h
+                );
+
+
+                paint.drawText(
+                    2,
+                    5 +
+                    paint.fontMetrics().ascent(),
+                    tr("Bari")
+                );
+
+
+            } else {
+
+                if (scale.isLogarithmic()) {
+
+                    LogNumericalScale()
+                        .paintVertical(
+                            v,
+                            scale,
+                            paint,
+                            0
+                        );
+
+                } else {
+
+                    LinearNumericalScale()
+                        .paintVertical(
+                            v,
+                            scale,
+                            paint,
+                            0
+                        );
+                }
+
+
+                if (getScaleUnits() != "") {
+
+                    int mw =
+                        w - 5;
+
+                    paint.drawText(
+                        5,
+                        5 +
+                        paint.fontMetrics().ascent(),
+                        TextAbbrev::abbreviate(
+                            getScaleUnits(),
+                            paint.fontMetrics(),
+                            mw
+                        )
+                    );
+                }
+            }
+        }
+
+
+        void
+        FlexiNoteLayer::drawStart
+        "@
+
+        Replace-One `
+            "svgui/layer/FlexiNoteLayer.cpp" `
+            $axisPattern `
+            $axisReplacement `
+            "Bari Y-axis drawing patch"
+
+
+        # ------------------------------------------------------------
+        # 6. IMPORTANT:
+        #
+        # Force Tony's Pane to use the FlexiNote layer for the
+        # visible left-hand vertical scale whenever that layer is
+        # present and visible.
+        #
+        # Previously Pane.cpp could choose WaveformLayer instead,
+        # resulting in:
+        #
+        #  1
+        #  0
+        # -1
+        #
+        # even though our FlexiNote bari scale existed.
+        # ------------------------------------------------------------
+
+        $panePattern = 'm_scaleWidth = 0;\s*if \(m_manager &&\s*m_manager->shouldShowVerticalScale\(\) && topLayer\) \{\s*drawVerticalScale\(r, topLayer, paint\);\s*\}'
+
+        $paneReplacement = @"
+        m_scaleWidth = 0;
+
+            if (
+                m_manager &&
+                m_manager->shouldShowVerticalScale() &&
+                topLayer
+            ) {
+
+                Layer *verticalScaleLayer = topLayer;
+
+                // Prefer a visible FlexiNote layer as the
+                // reference scale for Tony.
+                //
+                // This makes the left-hand scale correspond
+                // to the pitch/note display rather than the
+                // waveform amplitude.
+
+                for (
+                    auto i = m_layerStack.rbegin();
+                    i != m_layerStack.rend();
+                    ++i
+                ) {
+
+                    Layer *candidate = *i;
+
+                    if (
+                        candidate->isLayerDormant(this)
+                    ) {
+                        continue;
+                    }
+
+                    if (
+                        dynamic_cast<FlexiNoteLayer *>(
+                            candidate
+                        )
+                    ) {
+                        verticalScaleLayer =
+                            candidate;
+
+                        break;
+                    }
+                }
+
+                drawVerticalScale(
+                    r,
+                    verticalScaleLayer,
+                    paint
+                );
+            }
+        "@
+
+        Replace-One `
+            "svgui/view/Pane.cpp" `
+            $panePattern `
+            $paneReplacement `
+            "Prefer FlexiNote Y-axis patch"
+
+
+        Write-Host ""
+        Write-Host "All baritone display patches applied successfully."
+
 
     - name: configure
       run: meson setup build --buildtype release
 
     - name: copy-qt-etc
       run: |
-          foreach ($lib in 'Core','Gui','Widgets','Network','Xml','Svg','Test') { copy "..\Qt\6.6.1\msvc2019_64\bin\Qt6$lib.dll" build }
+          foreach ($lib in 'Core','Gui','Widgets','Network','Xml','Svg','Test') {
+              copy "..\Qt\6.6.1\msvc2019_64\bin\Qt6$lib.dll" build
+          }
+
           cp sv-dependency-builds\win64-msvc\lib\libsndfile-1.dll build
 
     - name: build
       run: ninja -C build
+
+    - name: Deploy Qt runtime
+      shell: pwsh
+      run: |
+        $windeployqt =
+            "..\Qt\6.6.1\msvc2019_64\bin\windeployqt.exe"
+
+        if (!(Test-Path $windeployqt)) {
+            throw "windeployqt.exe not found at $windeployqt"
+        }
+
+        if (!(Test-Path "build\tony.exe")) {
+            throw "Tony executable not found"
+        }
+
+        Write-Host "Running windeployqt..."
+
+        & $windeployqt `
+          --release `
+          --compiler-runtime `
+          --no-translations `
+          "build\tony.exe"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "windeployqt failed with exit code $LASTEXITCODE"
+        }
+
+        if (!(Test-Path "build\platforms\qwindows.dll")) {
+            throw "qwindows.dll was not deployed"
+        }
+
+        Write-Host "Qt runtime deployed successfully."
+
+        Get-Item "build\platforms\qwindows.dll"
 
     - name: Upload Tony Bari
       uses: actions/upload-artifact@v4
