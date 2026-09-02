@@ -1,35 +1,72 @@
 name: Windows CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
 
-    runs-on: windows-2019
+    runs-on: windows-2022
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+
     - uses: ProjectSavanna/setup-sml@v1.2.0
       with:
         smlnj-version: '110.99.4'
-    - uses: actions/setup-python@v1
+
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.x'
+
     - uses: jurplel/install-qt-action@v3
       with:
         version: '6.6.1'
         host: 'windows'
         target: 'desktop'
         arch: 'win64_msvc2019_64'
-    - uses: MarkusJx/install-boost@v2.4.5
-      id: install-boost
-      with:
-        boost_version: 1.84.0
-        platform_version: 2019
-        toolset: msvc
+
+    - name: Find or install Boost
+      shell: pwsh
+      run: |
+        $boost = Get-ChildItem C:\local -Directory -Filter "boost_*" -ErrorAction SilentlyContinue |
+          Sort-Object Name -Descending |
+          Select-Object -First 1
+
+        if ($boost) {
+            Write-Host "Using preinstalled Boost: $($boost.FullName)"
+            "BOOST_ROOT=$($boost.FullName)" >> $env:GITHUB_ENV
+        }
+        else {
+            Write-Host "No preinstalled Boost found."
+            Write-Host "Downloading official Boost 1.84.0 source ZIP..."
+
+            $zip = "$env:RUNNER_TEMP\boost_1_84_0.zip"
+            $dest = "$env:RUNNER_TEMP\boost"
+
+            Invoke-WebRequest `
+              "https://archives.boost.io/release/1.84.0/source/boost_1_84_0.zip" `
+              -OutFile $zip
+
+            Expand-Archive `
+              -Path $zip `
+              -DestinationPath $dest
+
+            $root = "$dest\boost_1_84_0"
+
+            if (!(Test-Path "$root\boost\version.hpp")) {
+                throw "Boost extraction failed: boost\version.hpp not found"
+            }
+
+            Write-Host "Boost installed at: $root"
+            "BOOST_ROOT=$root" >> $env:GITHUB_ENV
+        }
+
     - uses: ilammy/msvc-dev-cmd@v1
       with:
-        vsversion: '2019'
+        vsversion: '2022'
 
     - name: install-meson
       run: pip install meson ninja
@@ -37,10 +74,53 @@ jobs:
     - name: repoint
       run: ./repoint install
 
+    - name: Patch display for E-flat baritone sax
+      shell: pwsh
+      run: |
+        function Replace-One($path, $pattern, $replacement) {
+            $text = [IO.File]::ReadAllText($path)
+            $rx = [regex]::new($pattern)
+
+            $count = $rx.Matches($text).Count
+            if ($count -ne 1) {
+                throw "Expected exactly one match in $path, found $count"
+            }
+
+            $text = $rx.Replace($text, $replacement, 1)
+            [IO.File]::WriteAllText($path, $text)
+        }
+
+        # +21 semitones = written pitch for E-flat baritone sax
+        # Frequency multiplier = 2^(21/12) = 3.363585661014858
+
+        $timePattern = 'valueText = tr\("%1 Hz \(%2, %3\)"\)\s*\.arg\(value\)\s*\.arg\(Pitch::getPitchLabelForFrequency\(value\)\)\s*\.arg\(Pitch::getPitchForFrequency\(value\)\);'
+
+        $timeReplacement = @"
+        const double bariValue = value * 3.363585661014858;
+                valueText = tr("%1 (Bari)")
+                    .arg(Pitch::getPitchLabelForFrequency(bariValue));
+        "@
+
+        Replace-One `
+            "svgui/layer/TimeValueLayer.cpp" `
+            $timePattern `
+            $timeReplacement
+
+        $notePattern = 'pitchText = tr\("%1 Hz \(%2, %3\)"\)\s*\.arg\(note\.getValue\(\)\)\s*\.arg\(Pitch::getPitchLabelForFrequency\(note\.getValue\(\)\)\)\s*\.arg\(Pitch::getPitchForFrequency\(note\.getValue\(\)\)\);'
+
+        $noteReplacement = @"
+        const double bariValue = note.getValue() * 3.363585661014858;
+                pitchText = tr("%1 (Bari)")
+                    .arg(Pitch::getPitchLabelForFrequency(bariValue));
+        "@
+
+        Replace-One `
+            "svgui/layer/FlexiNoteLayer.cpp" `
+            $notePattern `
+            $noteReplacement
+
     - name: configure
       run: meson setup build --buildtype release
-      env:
-        BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
 
     - name: copy-qt-etc
       run: |
@@ -50,6 +130,12 @@ jobs:
     - name: build
       run: ninja -C build
 
+    - name: Upload Tony Bari
+      uses: actions/upload-artifact@v4
+      with:
+        name: Tony-Bari-Windows
+        path: build/
+        retention-days: 7
+
     - name: test
       run: meson test -C build
-      
